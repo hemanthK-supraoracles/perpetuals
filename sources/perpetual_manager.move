@@ -934,7 +934,6 @@ module perps::perpetual_manager {
         // Since we can't, this test will behave like `test_close_profitable_position` (0 PnL).
         // A true loss scenario would involve a mock oracle or dynamic pricing.
         // For demo purposes, the logic for `is_profit` in `close_position` is where this would be handled.
-        // Focus Dharana
         close_position<MyUSDC>(&trader, *string::bytes(&btc_symbol));
 
         // Assert that the position is gone and collateral is returned.
