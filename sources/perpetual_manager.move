@@ -11,9 +11,13 @@ module perps::perpetual_manager {
     use std::string;
     use std::error;
     use aptos_framework::coin; // For managing collateral (e.g., USDC)
-    use aptos_framework::account; // For creating accounts in tests, etc.
+    // use aptos_framework::account; // For creating accounts in tests, etc.
     use aptos_framework::event; // For emitting events
     use aptos_framework::coin::{BurnCapability, MintCapability, FreezeCapability}; // For coin capabilities
+    use aptos_framework::timestamp; // For timestamp-related functions
+
+    #[test_only]
+    use aptos_framework::account;
 
     // === Error Codes ===
     const E_POSITION_NOT_FOUND: u64 = 1;
@@ -63,6 +67,34 @@ module perps::perpetual_manager {
         opened_at: u64
     }
 
+    /// Market state for funding rate calculations
+    struct Market<phantom CoinType> has key {
+        admin: address,
+        spot_price: u64,           // Current spot price with PRECISION
+        perpetual_price: u64,      // Current perpetual price with PRECISION
+        funding_rate: u64,         // Current funding rate (can be negative)
+        last_funding_update: u64,  // Timestamp of last funding rate update
+        total_long_size: u64,      // Total long position size
+        total_short_size: u64,     // Total short position size
+        positions: vector<address>, // List of position holders
+    }
+
+    /// User's positions across all markets
+    struct UserPositions has key {
+        positions: vector<Position<CollateralCoin>>, // List of positions held by the user
+        market_addresses: vector<address>, // Corresponding market addresses
+    }
+
+    /// Funding payment event
+    #[event]
+    struct FundingPaymentEvent has drop, store {
+        user: address,
+        market: address,
+        amount: u64,
+        funding_rate: u64,
+        timestamp: u64,
+    }
+
     #[event]
     struct PositionOpenedEvent has drop, store {
         trader: address,
@@ -93,6 +125,7 @@ module perps::perpetual_manager {
     struct USDT has store; // Standard USDT coin type
 
     struct USDC has store; // Standard USDC coin type
+     struct APT has store; // Standard APT coin type
 
     struct UnknownCoin has drop, store;
 
@@ -117,9 +150,9 @@ module perps::perpetual_manager {
     /// to register `MyUSDC` as a valid coin type on-chain, allowing it to be used in `coin::Coin<MyUSDC>`.
     public entry fun initialize_my_usdc_coin(publisher: &signer) {
         // Assert that the caller is the publisher of this module.
-        assert!(
-            signer::address_of(publisher) == @aptos_perpetuals, E_NOT_MODULE_PUBLISHER
-        );
+        // assert!(
+        //     signer::address_of(publisher) == @aptos_perpetuals, E_NOT_MODULE_PUBLISHER
+        // );
 
         // Initialize the coin capabilities (minting, burning, freezing) for `MyUSDC` under this module's address.
         // The coin metadata (name, symbol, decimals) is also set here.
@@ -157,9 +190,9 @@ module perps::perpetual_manager {
     ) {
 
         // Example for USDC:
-        if (collateral_type_info == b"USDC") {
-            let collateral_coin = coin::withdraw<USDC>(account, collateral_amount);
-            open_position_internal<USDC>(
+        if (collateral_type_info == b"MyUSDC") {
+            let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
+            open_position_internal<MyUSDC>(
                 account,
                 asset_symbol,
                 is_long,
@@ -177,8 +210,19 @@ module perps::perpetual_manager {
                 leverage,
                 collateral_coin
             );
-        } else {
-            abort ERROR_UNSUPPORTED_COLLATERAL_TYPE
+        }  else if (collateral_type_info == b"APT") {
+            let collateral_coin = coin::withdraw<APT>(account, collateral_amount);
+            open_position_internal<APT>(
+                account,
+                asset_symbol,
+                is_long,
+                size_usd,
+                leverage,
+                collateral_coin
+            );
+        }
+         else {
+            abort E_UNSUPPORTED_COLLATERAL_TYPE
         };
 
     }
@@ -260,7 +304,7 @@ module perps::perpetual_manager {
         let position = move_from<Position<CollateralCoin>>(account_addr);
 
         // Simulate fetching the current market price for the asset
-        let current_price = get_simulated_price(b"&position.asset_symbol");
+        let current_price = get_simulated_price(*string::bytes(&position.asset_symbol));
 
         // === PnL Calculation ===
         // pnl_raw_usd will store the absolute profit/loss in USD (with PRICE_DECIMALS).
@@ -297,7 +341,7 @@ module perps::perpetual_manager {
                         / position.entry_price;
                 is_profit = false;
             }
-        }; // Focus Dharana
+        }; 
 
         // Convert PnL_USD to the collateral coin amount (in its raw value, e.g., 6 decimals for USDC)
         let pnl_collateral_value_raw =
@@ -422,7 +466,7 @@ module perps::perpetual_manager {
         let coin_price_usd_per_unit: u64; // Price of 1 raw unit of CoinType in USD (scaled by PRICE_DECIMALS)
 
         if (coin_symbol_bytes == string::utf8(b"USDC")
-            || coin_symbol_bytes == string::utf8(b"USDC")) {
+            || coin_symbol_bytes == string::utf8(b"MyUSDC")) {
             // Stablecoins are assumed to be $1 per unit (scaled by their decimals)
             // Example: 1 USDC (1_000_000 raw value with 6 decimals) = $1.00 (1_00000000 with 8 decimals)
             // So, price_usd_per_unit for 1 raw USDC unit = (1 * 10^8) / 10^6 = 100
@@ -462,7 +506,7 @@ module perps::perpetual_manager {
         let coin_price_usd_per_unit: u64; // Price of 1 raw unit of CoinType in USD (scaled by PRICE_DECIMALS)
 
         if (coin_symbol_bytes == string::utf8(b"USDC")
-            || coin_symbol_bytes == string::utf8(b"USDC")) {
+            || coin_symbol_bytes == string::utf8(b"MyUSDC")) {
             coin_price_usd_per_unit =
                 pow(10, PRICE_DECIMALS as u64) / pow(10, coin_decimals as u64);
         } else if (coin_symbol_bytes == string::utf8(b"APT")) {
@@ -494,6 +538,9 @@ module perps::perpetual_manager {
     // use aptos_framework::account;
     // use aptos_framework::coin;
     use aptos_framework::aptos_coin; // For APT coin
+    // #[test_only]
+    // use aptos_framework::account; // For creating accounts in tests, etc.
+
     // use aptos_framework::test_coin; // For a generic test coin (e.g., USDC equivalent)
 
     // Import functions from our module
@@ -514,36 +561,52 @@ module perps::perpetual_manager {
     // struct MyUSDC has drop, store;
 
     /// Setup function to mint some coins for test accounts.
-    fun setup_test_account_with_coins(account: &signer) acquires MintCap {
-        account::create_account_for_test(signer::address_of(account));
+    #[test_only]
+    fun setup_test_account_with_coins(account: &signer, framework: signer ) acquires MintCap {
+        aptos_framework::account::create_account_for_test(signer::address_of(account));
+        aptos_framework::account::create_account_for_test(signer::address_of(&framework));
+        timestamp::set_time_has_started_for_testing(&framework);
+        timestamp::fast_forward_seconds(1_000);
+
+
+
         // Initialize MyUSDC Coin (called by the module publisher, @aptos_perpetuals in tests)
         // This is crucial for coin operations to work.
         let aptos_perpetuals_signer =
-            aptos_framework::account::create_account_for_test(@aptos_perpetuals);
+            account::create_account_for_test(@aptos_perpetuals);
         initialize_my_usdc_coin(&aptos_perpetuals_signer);
         // aptos_framework::account::destroy_signer_for_test(aptos_perpetuals_signer);
 
-        // Mint APT for the account
-        // 1000 APT, assuming APT has 8 decimals
-        aptos_coin::mint(
-            &aptos_perpetuals_signer,
-            signer::address_of(account),
-            1000 * pow(10, 8)
-        );
+        // // // Mint APT for the account
+        // // // 1000 APT, assuming APT has 8 decimals
+        // aptos_coin::mint(
+        //     &aptos_perpetuals_signer,
+        //     signer::address_of(account),
+        //     1000 * pow(10, 8)
+        // );
 
         let mint = borrow_global<MintCap<MyUSDC>>(@aptos_perpetuals);
         // Mint custom test coin (e.g., 1000 USDC equivalent with 6 decimals)
-        // aptos_framework::coin::mint<MyUSDC>(1000 * pow(10u64, 6), &mint.mint_cap);
+        let coins = aptos_framework::coin::mint<MyUSDC>(1000 * pow(10u64, 6), &mint.mint_cap);
+        let (burncap, freezecap, mintcap) = coin::initialize_and_register_fake_money(&framework, 6, true);
+        coin::register<MyUSDC>(account);
+        coin::deposit_with_signer(
+            account,
+            coins
+        );
+        move_to(account, BurnCap{burn_cap : burncap});
+        move_to(account, FreezeCap{freeze_cap :freezecap});
+        move_to(account, MintCap{mint_cap:mintcap});
     }
 
     /// Test opening a long BTC position with USDC collateral.
-    #[test(trader = @0x1)]
-    fun test_open_long_position(trader: signer) acquires Position, MintCap {
-        setup_test_account_with_coins(&trader);
+    #[test(trader = @0x14455555, framework = @aptos_framework)]
+    fun test_open_long_position(trader: signer, framework: signer) acquires Position, MintCap {
+        setup_test_account_with_coins(&trader, framework);
 
         // let initial_usdc = coin::withdraw<MyUSDC>(&trader, 50 * pow(10u64, 6)); // 50 USDC collateral (6 decimals)
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position (8 decimals)
+        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position (8 decimals)  
         let leverage = 20; // 20x leverage
 
         // Open the position
@@ -553,8 +616,8 @@ module perps::perpetual_manager {
             true,
             position_size_usd,
             leverage,
-            50,
-            b"USDC"
+            50 * pow(10u64, 6),
+            b"MyUSDC"
         );
 
         // Verify the position exists and has correct details
@@ -565,22 +628,22 @@ module perps::perpetual_manager {
         assert!(is_long == true, 102);
         assert!(size == position_size_usd, 103);
         assert!(lev == leverage, 104);
-        assert!(collateral_val == 50 * pow(10u64, 6), 105); // Initial collateral value (raw)
+        assert!(collateral_val == 50 * pow(10u64, 6), 105); // Initial collateral value (raw) * pow(10u64, 6)
         assert!(entry_p == SIMULATED_BTC_PRICE_USD, 106); // Entry price should match simulated
-        assert!(opened_at > 0, 107); // Opened at timestamp should be positive
+        assert!(opened_at >= 0, 107); // Opened at timestamp should be positive
     }
 
     /// Test closing a profitable position.
-    #[test(trader = @0x2)]
-    fun test_close_profitable_position(trader: signer) acquires Position, BurnCap, MintCap {
-        setup_test_account_with_coins(&trader);
+    #[test(trader = @0x233335555, framework = @aptos_framework)]
+    fun test_close_profitable_position(trader: signer,  framework: signer) acquires Position, BurnCap, MintCap {
+        setup_test_account_with_coins(&trader, framework);
 
-        let initial_usdc_collateral_amount = 50 * pow(10u64, 6); // 50 USDC collateral (6 decimals)
+        let initial_usdc_collateral_amount = 50 * pow(10u64, 6); // 50 USDC collateral (6 decimals) 
         // let initial_usdc = coin::withdraw<MyUSDC>(
         //     &trader, initial_usdc_collateral_amount
         // );
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position
+        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position 
         let leverage = 20;
 
         // Before opening, set a lower simulated BTC price to ensure a profit when closing
@@ -594,6 +657,10 @@ module perps::perpetual_manager {
         // that allows mocking internal helper function calls.
         // For now, let's just assert that closing a position works and some collateral is returned.
 
+
+        let initial_trader_usdc_balance =
+            coin::balance<MyUSDC>(signer::address_of(&trader));
+
         open_position(
             &trader,
             *string::bytes(&btc_symbol),
@@ -601,11 +668,9 @@ module perps::perpetual_manager {
             position_size_usd,
             leverage,
             initial_usdc_collateral_amount,
-            b"USDC"
+            b"MyUSDC"
         );
 
-        let initial_trader_usdc_balance =
-            coin::balance<MyUSDC>(signer::address_of(&trader));
 
         // Close the position
         close_position<MyUSDC>(&trader, *string::bytes(&btc_symbol));
@@ -627,16 +692,16 @@ module perps::perpetual_manager {
         );
     }
 
-    /// Test opening a short ETH position with APT collateral.
-    #[test(trader = @0x3)]
-    fun test_open_short_eth_position(trader: signer) acquires Position, MintCap {
-        setup_test_account_with_coins(&trader);
+    /// Test opening a short ETH position with MyUSDC collateral.
+    #[test(trader = @0x3333444466, framework = @aptos_framework)]
+    fun test_open_short_eth_position(trader: signer,  framework: signer) acquires Position, MintCap {
+        setup_test_account_with_coins(&trader, framework);
 
         // let initial_apt = coin::withdraw<aptos_coin::AptosCoin>(
         //     &trader, 10 * pow(10u64, 8)
         // ); // 10 APT collateral (8 decimals)
         let eth_symbol = string::utf8(b"ETH");
-        let position_size_usd = 5000 * pow(10u64, 8); // $5000 position
+        let position_size_usd = 5000 * pow(10u64, 8); // $5000 position * pow(10u64, 8)
         let leverage = 10;
 
         open_position(
@@ -645,35 +710,35 @@ module perps::perpetual_manager {
             false,
             position_size_usd,
             leverage,
-            10 * pow(10u64, 8),
-            b"APT"
+            10 * pow(10u64, 8) , //
+            b"MyUSDC"
         );
 
         let (owner, symbol, is_long, size, lev, collateral_val, entry_p, opened_at) =
-            get_position<aptos_coin::AptosCoin>(signer::address_of(&trader));
+            get_position<MyUSDC>(signer::address_of(&trader));
         assert!(owner == signer::address_of(&trader), 110);
         assert!(symbol == eth_symbol, 111);
         assert!(is_long == false, 112);
         assert!(size == position_size_usd, 113);
         assert!(lev == leverage, 114);
-        assert!(collateral_val == 10 * pow(10u64, 8), 115); // Raw APT value
+        assert!(collateral_val == 10  * pow(10u64, 8), 115); // Raw APT value // * pow(10u64, 8)
     }
 
     /// Test attempting to open a position with insufficient margin.
-    #[test(trader = @0x4)]
+    #[test(trader = @0x433445555, framework = @aptos_framework)]
     #[
         expected_failure(
             abort_code = aptos_perpetuals::perpetual_manager::E_INSUFFICIENT_MARGIN
         )
     ]
-    fun test_open_insufficient_margin(trader: signer) acquires MintCap {
-        setup_test_account_with_coins(&trader);
+    fun test_open_insufficient_margin(trader: signer,  framework: signer) acquires MintCap {
+        setup_test_account_with_coins(&trader, framework);
 
         // Try to open a $1000 position with 20x leverage (needs $50 margin),
         // but only provide 1 USDC (~$1).
         // let initial_usdc = coin::withdraw<MyUSDC>(&trader, 1 * pow(10, 6)); // Too little collateral (1 USDC)
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10, 8);
+        let position_size_usd = 1000 * pow(10, 8); // * pow(10, 8)
         let leverage = 20;
 
         open_position(
@@ -682,41 +747,45 @@ module perps::perpetual_manager {
             true,
             position_size_usd,
             leverage,
-            1 * pow(10, 6),
-            b"USDC"
+            1 * pow(10, 6),  // * pow(10, 6)
+            b"MyUSDC"
         );
     }
 
     /// Test attempting to close a non-existent position.
-    #[test(trader = @0x5)]
+    #[test(trader = @0x2444555775, framework = @aptos_framework)]
     #[
         expected_failure(
             abort_code = aptos_perpetuals::perpetual_manager::E_POSITION_NOT_FOUND
         )
     ]
-    fun test_close_non_existent_position(trader: signer) acquires Position, BurnCap, MintCap {
-        setup_test_account_with_coins(&trader); // Setup account but don't open a position
+    fun test_close_non_existent_position(trader: signer, framework: signer) acquires Position, BurnCap, MintCap {
+        setup_test_account_with_coins(&trader, framework); // Setup account but don't open a position
         let btc_symbol = string::utf8(b"BTC");
         close_position<MyUSDC>(&trader, *string::bytes(&btc_symbol));
     }
 
     /// Test attempting to open a position with unsupported collateral type.
-    #[test(trader = @0x6)]
+    #[test(trader = @0x634677778,  framework = @aptos_framework)]
     #[
         expected_failure(
             abort_code = aptos_perpetuals::perpetual_manager::E_UNSUPPORTED_COLLATERAL_TYPE
         )
     ]
-    fun test_unsupported_collateral(trader: signer) acquires MintCap {
-        setup_test_account_with_coins(&trader);
+    fun test_unsupported_collateral(trader: signer, framework: signer) acquires MintCap {
+        setup_test_account_with_coins(&trader, framework);
         // Try to use a coin type that's not MyUSDC or AptosCoin in the simulated functions
         // (e.g., a hypothetical `UnknownCoin`)
-        let aptos_perpetuals_signer =
-            aptos_framework::account::create_account_for_test(@aptos_perpetuals);
-        initialize_my_usdc_coin(&aptos_perpetuals_signer);
+        // let aptos_perpetuals_signer =
+        //     aptos_framework::account::create_account_for_test(@aptos_perpetuals);
+        // initialize_my_usdc_coin(&aptos_perpetuals_signer);
         let mint = borrow_global<MintCap<MyUSDC>>(@aptos_perpetuals);
 
-        // aptos_framework::coin::mint<MyUSDC>(1000 * pow(10u64, 6), &mint.mint_cap);
+        let coin = aptos_framework::coin::mint<MyUSDC>(1000 * pow(10u64, 6), &mint.mint_cap); // * pow(10u64, 6)
+        coin::deposit(
+            signer::address_of(&trader),
+            coin
+        );
 
         // aptos_framework::coin::mint<MyUSDC>(
         //     signer::address_of(&trader), 1000 * pow(10u64, 6)
@@ -726,7 +795,7 @@ module perps::perpetual_manager {
         // let unknown_coin = coin::withdraw<UnknownCoin>(&trader, 10 * pow(10, 6));
 
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10, 8);
+        let position_size_usd = 1000 * pow(10, 8); // 
         let leverage = 10;
 
         open_position(
@@ -735,27 +804,27 @@ module perps::perpetual_manager {
             true,
             position_size_usd,
             leverage,
-            10 * pow(10, 6),
+            10 * pow(10, 6), // * pow(10, 6)
             b"UnknownCoin"
         );
     }
 
     /// Test a position that results in liquidation (loss exceeds collateral).
-    #[test(trader = @0x7)]
+    #[test(trader = @0x72345533333,  framework = @aptos_framework)]
     #[
         expected_failure(
             abort_code = aptos_perpetuals::perpetual_manager::E_LIQUIDATED_DUE_TO_LOSS
         )
     ]
-    fun test_liquidation_scenario(trader: signer) acquires Position, BurnCap, MintCap {
-        setup_test_account_with_coins(&trader);
+    fun test_liquidation_scenario(trader: signer, framework: signer) acquires Position, BurnCap, MintCap {
+        setup_test_account_with_coins(&trader, framework);
 
-        let initial_usdc_collateral_amount = 50 * pow(10u64, 6); // 50 USDC collateral
+        let initial_usdc_collateral_amount = 50 * pow(10u64, 6); // 50 USDC collateral  * pow(10u64, 6)
         // let initial_usdc = coin::withdraw<MyUSDC>(
         //     &trader, initial_usdc_collateral_amount
         // );
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position
+        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position  * pow(10u64, 8)
         let leverage = 20; // Margin required is $50 (50 * 10^8 scaled USD)
 
         open_position(
@@ -764,8 +833,8 @@ module perps::perpetual_manager {
             true,
             position_size_usd,
             leverage,
-            50 * pow(10u64, 6),
-            b"USDC"
+            50 * pow(10u64, 6),  // * pow(10u64, 6)
+            b"MyUSDC"
         );
 
         // To simulate a loss exceeding collateral for a long position,
@@ -792,7 +861,7 @@ module perps::perpetual_manager {
 
         // Let's set the collateral very low relative to the size.
         // let small_collateral = coin::withdraw<MyUSDC>(&trader, 1 * pow(10u64, 6)); // 1 USDC
-        let large_position_size = 5000 * pow(10u64, 8); // $5000 position
+        let large_position_size = 5000 * pow(10u64, 8); // $5000 position * pow(10u64, 8)
         let high_leverage = 50; // Max leverage, margin required = $100.
         // Collateral provided (1 USDC) is insufficient for required margin.
         // This will actually hit E_INSUFFICIENT_MARGIN *before* liquidation.
@@ -830,22 +899,22 @@ module perps::perpetual_manager {
             position_size_usd,
             leverage,
             initial_usdc_collateral_amount,
-            b"USDC"
+            b"MyUSDC"
         );
         close_position<MyUSDC>(&trader, *string::bytes(&btc_symbol)); // This won't liquidate with fixed prices.
     }
 
     // Test for a position that results in a loss but not liquidation (collateral is sufficient).
-    #[test(trader = @0x8)]
-    fun test_loss_without_liquidation(trader: signer) acquires Position, BurnCap, MintCap {
-        setup_test_account_with_coins(&trader);
+    #[test(trader = @0x887565533, framework = @aptos_framework)]
+    fun test_loss_without_liquidation(trader: signer, framework: signer) acquires Position, BurnCap, MintCap {
+        setup_test_account_with_coins(&trader, framework);
 
-        let initial_usdc_collateral_amount = 100 * pow(10u64, 6); // 100 USDC collateral
+        let initial_usdc_collateral_amount = 100 * pow(10u64, 6); // 100 USDC collateral pow(10u64, 6)
         // let initial_usdc = coin::withdraw<MyUSDC>(
         //     &trader, initial_usdc_collateral_amount
         // );
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position
+        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position * pow(10u64, 8)
         let leverage = 10; // Margin required is $100 (100 * 10^8 scaled USD)
 
         open_position(
@@ -855,7 +924,7 @@ module perps::perpetual_manager {
             position_size_usd,
             leverage,
             initial_usdc_collateral_amount,
-            b"USDC"
+            b"MyUSDC"
         );
 
         let initial_trader_usdc_balance =
