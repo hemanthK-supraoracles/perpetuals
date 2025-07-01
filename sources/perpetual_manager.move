@@ -11,6 +11,7 @@ module perps::perpetual_manager {
     use std::string;
     use std::error;
     use std::debug;
+    use std::vector;
 
     use aptos_framework::coin; // For managing collateral (e.g., USDC)
     // use aptos_framework::account; // For creating accounts in tests, etc.
@@ -37,6 +38,16 @@ module perps::perpetual_manager {
     const SIMULATED_ETH_PRICE_USD: u64 = 3000_00000000; // $3,000 for ETH (8 decimals)
     const SIMULATED_APT_PRICE_USD: u64 = 10_00000000; // $10 for APT (8 decimals)
     const PRICE_DECIMALS: u8 = 8; // Assuming 8 decimals for prices in USD values
+
+    // Constants
+    const FUNDING_INTERVAL_SECONDS: u64 = 28800; // 8 hours in seconds
+    const BASE_FUNDING_RATE: u64 = 1000; // 0.01% in basis points (10000 = 1%)
+    const MAX_FUNDING_RATE: u64 = 75000; // 0.75% max funding rate
+    const PRECISION: u64 = 1000000; // 6 decimal precision
+
+    // Funding rate direction
+    const FUNDING_POSITIVE: u8 = 1; // Longs pay shorts
+    const FUNDING_NEGATIVE: u8 = 2; // Shorts pay longs
 
     // === Struct Definitions ===
 
@@ -66,15 +77,23 @@ module perps::perpetual_manager {
         // Stored with PRICE_DECIMALS.
         entry_price: u64,
         // The timestamp when the position was opened.
-        opened_at: u64
+        opened_at: u64,
+        // Timestamp of last funding payment
+        last_funding_payment: u64,
+        // Accumulated unpaid funding amount
+        unrealized_funding_amount: u64,
+        // FUNDING_POSITIVE or FUNDING_NEGATIVE
+        unrealized_funding_direction: u8
     }
 
-    /// Market state for funding rate calculations
+    /// Market state for a asset(CoinType) for funding rate calculations
+    /// User can open multiple positions at different prices for the same asset
     struct Market<phantom CoinType> has key {
         admin: address,
         spot_price: u64, // Current spot price with PRECISION
         perpetual_price: u64, // Current perpetual price with PRECISION
-        funding_rate: u64, // Current funding rate (can be negative)
+        funding_rate_amount: u64, // Current funding rate (can be negative)
+        funding_rate_direction: u8, // FUNDING_POSITIVE or FUNDING_NEGATIVE
         last_funding_update: u64, // Timestamp of last funding rate update
         total_long_size: u64, // Total long position size
         total_short_size: u64, // Total short position size
@@ -82,10 +101,10 @@ module perps::perpetual_manager {
     }
 
     /// User's positions across all markets
-    // struct UserPositions has key {
-    //     positions: vector<Position<CollateralCoin>>, // List of positions held by the user
-    //     market_addresses: vector<address>, // Corresponding market addresses
-    // }
+    struct UserPositions<phantom CollateralCoin> has key {
+        positions: vector<Position<CollateralCoin>>, // List of positions held by the user
+        market_addresses: vector<address> // Corresponding market addresses
+    }
 
     /// Funding payment event
     #[event]
@@ -130,9 +149,7 @@ module perps::perpetual_manager {
 
     struct APT has store; // Standard APT coin type
 
-    struct UnknownCoin has drop, store;
-
-    // struct CollateralCoin has store;
+    struct UnknownCoin has store; // Unknown coin type
 
     struct BurnCap<phantom CoinType> has key {
         burn_cap: BurnCapability<CoinType>
@@ -153,9 +170,9 @@ module perps::perpetual_manager {
     /// to register `MyUSDC` as a valid coin type on-chain, allowing it to be used in `coin::Coin<MyUSDC>`.
     public entry fun initialize_my_usdc_coin(publisher: &signer) {
         // Assert that the caller is the publisher of this module.
-        // assert!(
-        //     signer::address_of(publisher) == @aptos_perpetuals, E_NOT_MODULE_PUBLISHER
-        // );
+        assert!(
+            signer::address_of(publisher) == @aptos_perpetuals, E_NOT_MODULE_PUBLISHER
+        );
 
         // Initialize the coin capabilities (minting, burning, freezing) for `MyUSDC` under this module's address.
         // The coin metadata (name, symbol, decimals) is also set here.
@@ -178,11 +195,35 @@ module perps::perpetual_manager {
 
     }
 
+    /// Initialize a new perpetual market
+    public fun initialize_market<CoinType>(
+        admin: &signer, initial_spot_price: u64, initial_perpetual_price: u64
+    ) {
+        let admin_addr = signer::address_of(admin);
+
+        assert!(admin_addr == @aptos_perpetuals, E_NOT_MODULE_PUBLISHER);
+
+        let market = Market<CoinType> {
+            admin: admin_addr,
+            spot_price: initial_spot_price,
+            perpetual_price: initial_perpetual_price,
+            funding_rate_amount: 0,
+            funding_rate_direction: FUNDING_POSITIVE, // Default to positive funding rate
+            last_funding_update: timestamp::now_seconds(),
+            total_long_size: 0,
+            total_short_size: 0,
+            positions: vector::empty()
+        };
+
+        move_to(admin, market);
+    }
+
     /// Initializes a new position for the caller.
     /// This function would typically be called when a user first opens a position.
     /// It requires a `Coin` to be deposited as initial margin.
     public entry fun open_position(
         account: &signer,
+        market_addr: address, // Address of the market where the position is opened
         asset_symbol: vector<u8>, // e.g., b"BTC"
         is_long: bool,
         size_usd: u64, // Total position size in USD (e.g., 10000_00000000 for $10,000 in 8 decimals)
@@ -190,16 +231,16 @@ module perps::perpetual_manager {
         // collateral_amount: coin::Coin<CollateralCoin>,
         collateral_amount: u64,
         collateral_type_info: vector<u8> // Type info as bytes
-    ) {
+    ) acquires UserPositions {
 
         // Example for USDC:
         if (collateral_type_info == b"MyUSDC") {
             let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
             let collateral_balance = coin::balance<MyUSDC>(signer::address_of(account));
-            // debug::print(&collateral_balance);
 
             open_position_internal<MyUSDC>(
                 account,
+                market_addr,
                 asset_symbol,
                 is_long,
                 size_usd,
@@ -210,6 +251,7 @@ module perps::perpetual_manager {
             let collateral_coin = coin::withdraw<USDT>(account, collateral_amount);
             open_position_internal<USDT>(
                 account,
+                market_addr,
                 asset_symbol,
                 is_long,
                 size_usd,
@@ -220,6 +262,7 @@ module perps::perpetual_manager {
             let collateral_coin = coin::withdraw<APT>(account, collateral_amount);
             open_position_internal<APT>(
                 account,
+                market_addr,
                 asset_symbol,
                 is_long,
                 size_usd,
@@ -234,12 +277,13 @@ module perps::perpetual_manager {
 
     fun open_position_internal<CollateralCoin>(
         account: &signer,
+        market_addr: address,
         asset_symbol: vector<u8>,
         is_long: bool,
         size_usd: u64,
         leverage: u64,
         collateral_amount: coin::Coin<CollateralCoin>
-    ) {
+    ) acquires UserPositions {
         let account_addr = signer::address_of(account);
 
         // Assert that the position does not already exist for this account and asset
@@ -272,11 +316,28 @@ module perps::perpetual_manager {
             leverage,
             collateral_amount, // The actual Coin<CollateralCoin> is held directly by the Position resource.
             entry_price: current_price,
-            opened_at: aptos_framework::timestamp::now_seconds() // Using Aptos's timestamp
+            opened_at: aptos_framework::timestamp::now_seconds(), // Using Aptos's timestamp
+            unrealized_funding_amount: 0, // Initial unrealized funding amount
+            unrealized_funding_direction: FUNDING_POSITIVE, // Default to positive funding direction
+            last_funding_payment: 0 // No funding payments made yet
         };
 
+        // Initialize user positions if not exists
+        if (!exists<UserPositions<CollateralCoin>>(account_addr)) {
+            let user_positions = UserPositions<CollateralCoin> {
+                positions: vector::empty<Position<CollateralCoin>>(),
+                market_addresses: vector::empty()
+            };
+            move_to(account, user_positions);
+        };
+
+        let user_positions =
+            borrow_global_mut<UserPositions<CollateralCoin>>(account_addr);
+        vector::push_back(&mut user_positions.positions, new_position);
+        vector::push_back(&mut user_positions.market_addresses, market_addr);
+
         // Move the new Position resource under the user's account address.
-        move_to(account, new_position);
+        // move_to(account, new_position);
 
         // Emit an event to indicate the position was opened.
         event::emit(
@@ -295,8 +356,8 @@ module perps::perpetual_manager {
     /// Closes an existing perpetual position for the caller.
     /// This function calculates PnL and returns collateral + profit/loss (or subtracts loss).
     public entry fun close_position<CollateralCoin>(
-        account: &signer, asset_symbol_bytes: vector<u8>
-    ) acquires Position, MintCap {
+        account: &signer, asset_symbol_bytes: vector<u8>, market_addr: address
+    ) acquires MintCap, UserPositions {
         let account_addr = signer::address_of(account);
 
         // Assert that a position exists for this account and asset.
@@ -306,7 +367,36 @@ module perps::perpetual_manager {
         );
 
         // Acquire the position resource from global storage (moves it out, effectively deleting it).
-        let position = move_from<Position<CollateralCoin>>(account_addr);
+        // let position = move_from<Position<CollateralCoin>>(account_addr);
+        assert!(
+            exists<UserPositions<CollateralCoin>>(account_addr),
+            E_POSITION_NOT_FOUND
+        );
+        let user_positions =
+            borrow_global_mut<UserPositions<CollateralCoin>>(account_addr);
+
+        let j = 0;
+        let pos_len = vector::length(&user_positions.positions);
+
+        while (j < pos_len) {
+            let market_addr_at_j = *vector::borrow(&user_positions.market_addresses, j);
+
+            if (market_addr_at_j == market_addr) {
+                let position = vector::remove(&mut user_positions.positions, j);
+                close_position_internal<CollateralCoin>(
+                    account_addr, position, asset_symbol_bytes
+                );
+            };
+            j = j + 1;
+        };
+
+    }
+
+    fun close_position_internal<CollateralCoin>(
+        account_addr: address,
+        position: Position<CollateralCoin>,
+        asset_symbol_bytes: vector<u8>
+    ) acquires MintCap {
 
         // Simulate fetching the current market price for the asset
         let current_price = get_simulated_price(*string::bytes(&position.asset_symbol));
@@ -418,7 +508,10 @@ module perps::perpetual_manager {
             leverage,
             collateral_amount,
             is_long,
-            opened_at
+            opened_at,
+            unrealized_funding_amount,
+            unrealized_funding_direction,
+            last_funding_payment
         } = position;
         let message3 = string::utf8(b"Depositing collateral amount is  :");
 
@@ -562,6 +655,265 @@ module perps::perpetual_manager {
                 / (coin_price_usd_per_unit * pow(10, PRICE_DECIMALS as u64));
 
         coin_raw_amount
+    }
+
+    /// Update spot and perpetual prices (only admin)
+    public fun update_prices<CoinType>(
+        admin: &signer,
+        market_addr: address,
+        new_spot_price: u64,
+        new_perpetual_price: u64
+    ) acquires Market {
+        let admin_addr = signer::address_of(admin);
+        let market = borrow_global_mut<Market<CoinType>>(market_addr);
+
+        assert!(
+            market.admin == admin_addr,
+            error::permission_denied(E_NOT_MODULE_PUBLISHER)
+        );
+
+        market.spot_price = new_spot_price;
+        market.perpetual_price = new_perpetual_price;
+
+        // Update funding rate based on new prices
+        update_funding_rate(market);
+    }
+
+    /// Update funding rate in market
+    fun update_funding_rate<CoinType>(market: &mut Market<CoinType>) {
+        let current_time = timestamp::now_seconds();
+
+        // Only update if enough time has passed
+        if (current_time >= market.last_funding_update + FUNDING_INTERVAL_SECONDS) {
+            let (rate_amount, rate_direction) =
+                calculate_funding_rate(market.spot_price, market.perpetual_price);
+            market.funding_rate_amount = rate_amount;
+            market.funding_rate_direction = rate_direction;
+            market.last_funding_update = current_time;
+        };
+    }
+
+    /// Calculate current funding rate based on price difference
+    fun calculate_funding_rate(spot_price: u64, perpetual_price: u64): (u64, u8) {
+        if (perpetual_price == 0 || spot_price == 0) {
+            return (0, FUNDING_POSITIVE)
+        };
+
+        // Calculate premium = |perpetual_price - spot_price| / spot_price
+        let (premium, is_positive) =
+            if (perpetual_price > spot_price) {
+                let diff = perpetual_price - spot_price;
+                (((diff * PRECISION) / spot_price), true)
+            } else {
+                let diff = spot_price - perpetual_price;
+                (((diff * PRECISION) / spot_price), false)
+            };
+
+        // Funding rate = base_rate + premium
+        let funding_rate_amount = BASE_FUNDING_RATE + premium;
+
+        // Cap the funding rate
+        let capped_rate =
+            if (funding_rate_amount > MAX_FUNDING_RATE) {
+                MAX_FUNDING_RATE
+            } else {
+                funding_rate_amount
+            };
+
+        let direction =
+            if (is_positive) {
+                FUNDING_POSITIVE // Perpetual > Spot, longs pay shorts
+            } else {
+                FUNDING_NEGATIVE // Perpetual < Spot, shorts pay longs
+            };
+
+        (capped_rate, direction)
+    }
+
+    /// Collect funding payments for all positions in a market
+    public fun collect_funding_payments<CoinType, CollateralCoin>(
+        market_addr: address
+    ) acquires Market, UserPositions {
+        let market = borrow_global_mut<Market<CoinType>>(market_addr);
+        update_funding_rate(market);
+
+        let current_time = timestamp::now_seconds();
+        let i = 0;
+        let len = vector::length(&market.positions);
+
+        while (i < len) {
+            let user_addr = *vector::borrow(&market.positions, i);
+
+            if (exists<UserPositions<CollateralCoin>>(user_addr)) {
+                let user_positions =
+                    borrow_global_mut<UserPositions<CollateralCoin>>(user_addr);
+                let j = 0;
+                let pos_len = vector::length(&user_positions.positions);
+
+                while (j < pos_len) {
+                    let market_addr_at_j =
+                        *vector::borrow(&user_positions.market_addresses, j);
+
+                    if (market_addr_at_j == market_addr) {
+                        let position = vector::borrow_mut(
+                            &mut user_positions.positions, j
+                        );
+                        let time_elapsed = current_time - position.last_funding_payment;
+
+                        if (time_elapsed >= FUNDING_INTERVAL_SECONDS) {
+                            let (funding_amount, funding_direction) =
+                                calculate_funding_payment(
+                                    position,
+                                    market.funding_rate_amount,
+                                    market.funding_rate_direction,
+                                    time_elapsed
+                                );
+
+                            // Update unrealized funding based on payment direction
+                            if (funding_direction == FUNDING_POSITIVE) {
+                                // Position owes money
+                                if (position.unrealized_funding_direction
+                                    == FUNDING_POSITIVE) {
+                                    position.unrealized_funding_amount =
+                                        position.unrealized_funding_amount
+                                            + funding_amount;
+                                } else {
+                                    // Different directions, net them out
+                                    if (position.unrealized_funding_amount
+                                        > funding_amount) {
+                                        position.unrealized_funding_amount =
+                                            position.unrealized_funding_amount
+                                                - funding_amount;
+                                    } else {
+                                        position.unrealized_funding_amount =
+                                            funding_amount
+                                                - position.unrealized_funding_amount;
+                                        position.unrealized_funding_direction =
+                                            FUNDING_POSITIVE;
+                                    };
+                                };
+                            } else {
+                                // Position receives money
+                                if (position.unrealized_funding_direction
+                                    == FUNDING_NEGATIVE) {
+                                    position.unrealized_funding_amount =
+                                        position.unrealized_funding_amount
+                                            + funding_amount;
+                                } else {
+                                    // Different directions, net them out
+                                    if (position.unrealized_funding_amount
+                                        > funding_amount) {
+                                        position.unrealized_funding_amount =
+                                            position.unrealized_funding_amount
+                                                - funding_amount;
+                                    } else {
+                                        position.unrealized_funding_amount =
+                                            funding_amount
+                                                - position.unrealized_funding_amount;
+                                        position.unrealized_funding_direction =
+                                            FUNDING_NEGATIVE;
+                                    };
+                                };
+                            };
+
+                            position.last_funding_payment = current_time;
+
+                            // Emit funding payment event (in a real implementation, you'd use events)
+                            // For now, we just update the position
+                        };
+                    };
+                    j = j + 1;
+                };
+            };
+            i = i + 1;
+        };
+    }
+
+    /// Calculate funding payment for a position
+    fun calculate_funding_payment<CollateralCoin>(
+        position: &Position<CollateralCoin>,
+        funding_rate_amount: u64,
+        funding_rate_direction: u8,
+        time_elapsed: u64
+    ): (u64, u8) {
+        if (time_elapsed == 0 || position.size_usd == 0) {
+            return (0, FUNDING_POSITIVE)
+        };
+
+        // Funding payment = position_size * funding_rate * (time_elapsed / FUNDING_INTERVAL_SECONDS)
+        let time_factor = (time_elapsed * PRECISION) / FUNDING_INTERVAL_SECONDS;
+        let base_payment = (position.size_usd * funding_rate_amount * time_factor)
+            / PRECISION;
+
+        // Determine who pays whom based on position type and funding direction
+        let payment_direction =
+            if (position.is_long) {
+                // Long positions: pay when funding is positive, receive when negative
+                funding_rate_direction
+            } else {
+                // Short positions: receive when funding is positive, pay when negative
+                if (funding_rate_direction == FUNDING_POSITIVE) {
+                    FUNDING_NEGATIVE // Short receives
+                } else {
+                    FUNDING_POSITIVE // Short pays
+                }
+            };
+
+        (base_payment, payment_direction)
+    }
+
+    /// Get current funding rate for a market
+    public fun get_funding_rate<CoinType>(market_addr: address): (u64, u8) acquires Market {
+        let market = borrow_global<Market<CoinType>>(market_addr);
+        (market.funding_rate_amount, market.funding_rate_direction)
+    }
+
+    /// Get position information
+    public fun get_position_info<CollateralCoin>(
+        user_addr: address, position_index: u64
+    ): (u64, bool, u64, u64, u64, u8) acquires UserPositions {
+        assert!(
+            exists<UserPositions<CollateralCoin>>(user_addr),
+            error::not_found(E_POSITION_NOT_FOUND)
+        );
+
+        let user_positions = borrow_global<UserPositions<CollateralCoin>>(user_addr);
+        assert!(
+            position_index < vector::length(&user_positions.positions),
+            error::invalid_argument(E_POSITION_NOT_FOUND)
+        );
+
+        let position = vector::borrow(&user_positions.positions, position_index);
+        (
+            position.size_usd,
+            position.is_long,
+            position.leverage,
+            position.entry_price,
+            position.unrealized_funding_amount,
+            position.unrealized_funding_direction
+        )
+    }
+
+    /// Get market statistics
+    public fun get_market_stats<CoinType>(
+        market_addr: address
+    ): (u64, u64, u64, u8, u64, u64) acquires Market {
+        let market = borrow_global<Market<CoinType>>(market_addr);
+        (
+            market.spot_price,
+            market.perpetual_price,
+            market.funding_rate_amount,
+            market.funding_rate_direction,
+            market.total_long_size,
+            market.total_short_size
+        )
+    }
+
+    /// Check if funding collection is needed
+    public fun needs_funding_collection<CoinType>(market_addr: address): bool acquires Market {
+        let market = borrow_global<Market<CoinType>>(market_addr);
+        let current_time = timestamp::now_seconds();
+        current_time >= market.last_funding_update + FUNDING_INTERVAL_SECONDS
     }
 
     // }
@@ -814,22 +1166,12 @@ module perps::perpetual_manager {
         setup_test_account_with_coins(&trader, framework);
         // Try to use a coin type that's not MyUSDC or AptosCoin in the simulated functions
         // (e.g., a hypothetical `UnknownCoin`)
-        // let aptos_perpetuals_signer =
-        //     aptos_framework::account::create_account_for_test(@aptos_perpetuals);
-        // initialize_my_usdc_coin(&aptos_perpetuals_signer);
         let mint = borrow_global<MintCap<MyUSDC>>(@aptos_perpetuals);
 
         let coin = aptos_framework::coin::mint<MyUSDC>(
             1000 * pow(10u64, 6), &mint.mint_cap
         ); // * pow(10u64, 6)
         coin::deposit(signer::address_of(&trader), coin);
-
-        // aptos_framework::coin::mint<MyUSDC>(
-        //     signer::address_of(&trader), 1000 * pow(10u64, 6)
-        // );
-
-        // test_coin::mint_to<UnknownCoin>(signer::address_of(&trader), 100 * pow(10u64, 6));
-        // let unknown_coin = coin::withdraw<UnknownCoin>(&trader, 10 * pow(10, 6));
 
         let btc_symbol = string::utf8(b"BTC");
         let position_size_usd = 1000 * pow(10, 8); //
