@@ -35,6 +35,7 @@ module perps::perpetual_manager {
     const E_UNSUPPORTED_COLLATERAL_TYPE: u64 = 7; // New: Collateral coin type not supported/known
     const E_LIQUIDATED_DUE_TO_LOSS: u64 = 8; // New: Position was liquidated due to margin call
     const ERROR_UNSUPPORTED_COLLATERAL_TYPE: u64 = 9; // New: Unsupported collateral type in open_position
+    const E_MARKET_NOT_INITIALIZED: u64 = 10; // New: Market not initialized for the asset
 
     // === Constants for simulation (in a real app, these would come from oracles) ===
     const SIMULATED_BTC_PRICE_USD: u64 = 65000_00000000; // $65,000 for BTC (8 decimals)
@@ -123,10 +124,8 @@ module perps::perpetual_manager {
     struct UserCollaterals has key, store {
         // Map from asset type to collateral amount
         // e.g., "USDC" -> 1000_000000 (1 USDC with 6 decimals)
-        list: table::Table<address, coin::Coin<MyUSDC>>, // List of user addresses and their USDC collateral
+        list: table::Table<address, coin::Coin<MyUSDC>> // List of user addresses and their USDC collateral
     }
-
-
 
     /// Funding payment event
     #[event]
@@ -262,6 +261,7 @@ module perps::perpetual_manager {
         let extend_ref = object::generate_extend_ref(&constructor_ref);
         move_to(&object_signer, ObjectController { extend_ref });
 
+        // Move the market object to the object signer
         move_to(&object_signer, market);
 
         if (exists<MarketRegistry>(@aptos_perpetuals)) {
@@ -289,7 +289,6 @@ module perps::perpetual_manager {
             );
             move_to(admin, registry);
         };
-
         // Return the address of the newly created market object.
         signer::address_of(&object_signer)
     }
@@ -309,21 +308,51 @@ module perps::perpetual_manager {
         collateral_type_info: vector<u8> // Type info as bytes
     ) acquires UserPositions {
 
-        // Example for USDC:
+        // For initial phase of development we are only considering MyUSDC as collateral
+        // but in production we can have multiple collateral types like USDC, USDT, APT etc.
+
         if (collateral_type_info == b"MyUSDC") {
-            let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
-            
-            if(exists<UserCollaterals>(signer::address_of(account))) {
-                let user_collaterals = borrow_global_mut<UserCollaterals>(signer::address_of(account));
-                table::add(&mut user_collaterals.list, signer::address_of(account), collateral_coin);
-            } else {
-                let user_collaterals = UserCollaterals {
-                    list: table::new<address, coin::Coin<MyUSDC>>()
-                };
-                table::add(&mut user_collaterals.list, signer::address_of(account), collateral_coin);
+            assert!(
+                coin::balance<MyUSDC>(account) > collateral_amount,
+                E_INSUFFICIENT_COLLATERAL_BALANCE
+            );
+
+            if (!exists<UserCollaterals>(@aptos_perpetuals)) {
+                // If UserCollaterals does not exist, we need to create it for user to store his collateral
+                let list = table::new<address, coin::Coin<MyUSDC>>();
+                table::add(
+                    &mut list,
+                    signer::address_of(account),
+                    collateral_coin
+                );
+                let user_collaterals = UserCollaterals { list };
                 move_to(account, user_collaterals);
+            } else {
+                let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
+                let user_collaterals =
+                    borrow_global_mut<UserCollaterals>(@aptos_perpetuals);
+
+                if (!table::contains_key(
+                    &user_collaterals.list, signer::address_of(account)
+                )) {
+                    // If the user does not have an entry, create one
+                    table::add(
+                        &mut user_collaterals.list,
+                        signer::address_of(account),
+                        collateral_coin
+                    );
+                } else {
+                    // If the user already has an entry, merge the collateral
+                    let existing_collateral =
+                        table::borrow_mut(
+                            &mut user_collaterals.list,
+                            signer::address_of(account)
+                        );
+                    coin::merge<MyUSDC>(existing_collateral, collateral_coin);
+                };
             };
 
+           
             open_position_internal<MyUSDC>(
                 account,
                 market_addr,
@@ -430,7 +459,7 @@ module perps::perpetual_manager {
             is_long,
             size_usd,
             leverage,
-            collateral_amount, // The actual Coin<CollateralCoin> is held directly by the Position resource.
+            collateral_amount, // The actual Coin<CollateralCoin> is held by UserCollaterals struct
             collateral_type: CollateralType {
                 coin_type: collateral_type_info // Store the type info as a string
             },
@@ -442,21 +471,9 @@ module perps::perpetual_manager {
             market_address: market_addr // Address of the market where this position exists
         };
 
-        // Initialize user positions if not exists
-        if (!exists<UserPositions>(account_addr)) {
-            let user_positions = UserPositions {
-                positions: vector::empty<Position>(),
-                market_addresses: vector::empty()
-            };
-            move_to(account, user_positions);
-        };
-
         let user_positions = borrow_global_mut<UserPositions>(account_addr);
         vector::push_back(&mut user_positions.positions, new_position);
         vector::push_back(&mut user_positions.market_addresses, market_addr);
-
-        // Move the new Position resource under the user's account address.
-        // move_to(account, new_position);
 
         // Emit an event to indicate the position was opened.
         event::emit(
