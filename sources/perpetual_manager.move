@@ -36,6 +36,8 @@ module perps::perpetual_manager {
     const E_LIQUIDATED_DUE_TO_LOSS: u64 = 8; // New: Position was liquidated due to margin call
     const ERROR_UNSUPPORTED_COLLATERAL_TYPE: u64 = 9; // New: Unsupported collateral type in open_position
     const E_MARKET_NOT_INITIALIZED: u64 = 10; // New: Market not initialized for the asset
+    const E_INSUFFICIENT_COLLATERAL_BALANCE: u64 = 11; // Insufficient collateral balance for the operation
+    const E_USER_HAS_NO_POSITIONS: u64 = 12; // User has no positions to close
 
     // === Constants for simulation (in a real app, these would come from oracles) ===
     const SIMULATED_BTC_PRICE_USD: u64 = 65000_00000000; // $65,000 for BTC (8 decimals)
@@ -58,7 +60,7 @@ module perps::perpetual_manager {
     /// Represents an open perpetual trading position for a user.
     /// This is a `resource` because it represents an asset (the position itself)
     /// that cannot be duplicated or implicitly discarded.
-    struct Position has key, store {
+    struct Position has key, copy, drop, store {
         // Owner of the position. This is the address where the Position resource is stored.
         owner: address,
         // The asset being traded (e.g., "BTC", "ETH"). Using a string for simplicity,
@@ -69,7 +71,7 @@ module perps::perpetual_manager {
         // Size of the position in USD (e.g., $10,000 worth of BTC).
         // Stored as a u64, assuming PRICE_DECIMALS for precision.
         // E.g., $10,000.00 would be 10000_00000000.
-        size_usd: u64,
+        size_value: u64,
         // Leverage used (e.g., 2x, 5x, 10x). Stored as a multiplier (e.g., 2, 5, 10).
         leverage: u64,
         // Amount of collateral in raw value (e.g., 1000 USDC = 1_000_000 with 6 decimals)
@@ -102,13 +104,13 @@ module perps::perpetual_manager {
         last_funding_update: u64, // Timestamp of last funding rate update
         total_long_size: u64, // Total long position size
         total_short_size: u64, // Total short position size
-        positions: vector<address> // List of position holders
+        positions: vector<address>, // List of position object addresses for this market
+        users: vector<address> // List of users who have positions in this market
     }
 
     /// User's positions across all markets
     struct UserPositions has key {
-        positions: vector<Position>, // List of positions held by the user
-        market_addresses: vector<address> // Corresponding market addresses
+        positions: vector<Position> // List of positions held by the user
     }
 
     /// Global market registry for discovering markets
@@ -117,14 +119,14 @@ module perps::perpetual_manager {
         // e.g., "BTC" -> market_address where Market<BTC> is stored
         asset_to_market: table::Table<string::String, address>,
 
-        // List of all active markets
+        // List of all active market object addresses
         active_markets: vector<address>
     }
 
-    struct UserCollaterals has key, store {
+    struct UserPositionCollaterals has key, store {
         // Map from asset type to collateral amount
         // e.g., "USDC" -> 1000_000000 (1 USDC with 6 decimals)
-        list: table::Table<address, coin::Coin<MyUSDC>> // List of user addresses and their USDC collateral
+        list: table::Table<address /*position_object_address*/, coin::Coin<MyUSDC>> // List of position object addresses and corresponding USDC collateral
     }
 
     /// Funding payment event
@@ -134,6 +136,7 @@ module perps::perpetual_manager {
         market: address,
         amount: u64,
         funding_rate: u64,
+        unrealized_amount: u64, // Unrealized funding amount after funding update
         timestamp: u64
     }
 
@@ -142,7 +145,7 @@ module perps::perpetual_manager {
         trader: address,
         asset_symbol: string::String,
         is_long: bool,
-        size_usd: u64,
+        size_value: u64,
         leverage: u64,
         collateral_value_usd: u64,
         entry_price: u64
@@ -153,7 +156,7 @@ module perps::perpetual_manager {
         trader: address,
         asset_symbol: string::String,
         is_long: bool,
-        size_usd: u64,
+        size_value: u64,
         leverage: u64,
         collateral_returned_value_usd: u64,
         pnl_usd: u64, // Absolute PnL in USD (always positive)
@@ -175,11 +178,11 @@ module perps::perpetual_manager {
     struct UnknownCoin has store; // Unknown coin type
 
     // Generic collateral coin type
-    struct CollateralType has store {
+    struct CollateralType has drop, store, copy {
         coin_type: string::String
     }
 
-    struct AssetType has store {
+    struct AssetType has drop, store, copy {
         coin_type: string::String
     }
 
@@ -237,7 +240,7 @@ module perps::perpetual_manager {
         initial_spot_price: u64,
         initial_perpetual_price: u64,
         asset_symbol: vector<u8>
-    ): address {
+    ): address acquires MarketRegistry {
         let admin_addr = signer::address_of(admin);
 
         assert!(admin_addr == @aptos_perpetuals, E_NOT_MODULE_PUBLISHER);
@@ -251,7 +254,8 @@ module perps::perpetual_manager {
             last_funding_update: timestamp::now_seconds(),
             total_long_size: 0,
             total_short_size: 0,
-            positions: vector::empty()
+            positions: vector::empty(),
+            users: vector::empty()
         };
 
         let constructor_ref = object::create_object(admin_addr);
@@ -301,89 +305,58 @@ module perps::perpetual_manager {
         market_addr: address, // Address of the market where the position is opened
         asset_symbol: vector<u8>, // e.g., b"BTC"
         is_long: bool,
-        size_usd: u64, // Total position size in USD (e.g., 10000_00000000 for $10,000 in 8 decimals)
+        size_value: u64, // Total position size in USD (e.g., 10000_00000000 for $10,000 in 8 decimals)
         leverage: u64, // e.g., 2, 5, 10
         // collateral_amount: coin::Coin<CollateralCoin>,
         collateral_amount: u64,
         collateral_type_info: vector<u8> // Type info as bytes
-    ) acquires UserPositions {
+    ) acquires UserPositions, UserPositionCollaterals {
 
         // For initial phase of development we are only considering MyUSDC as collateral
         // but in production we can have multiple collateral types like USDC, USDT, APT etc.
-
         if (collateral_type_info == b"MyUSDC") {
             assert!(
-                coin::balance<MyUSDC>(account) > collateral_amount,
+                coin::balance<MyUSDC>(signer::address_of(account)) > collateral_amount,
                 E_INSUFFICIENT_COLLATERAL_BALANCE
             );
 
-            if (!exists<UserCollaterals>(@aptos_perpetuals)) {
-                // If UserCollaterals does not exist, we need to create it for user to store his collateral
-                let list = table::new<address, coin::Coin<MyUSDC>>();
-                table::add(
-                    &mut list,
-                    signer::address_of(account),
-                    collateral_coin
-                );
-                let user_collaterals = UserCollaterals { list };
-                move_to(account, user_collaterals);
-            } else {
-                let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
-                let user_collaterals =
-                    borrow_global_mut<UserCollaterals>(@aptos_perpetuals);
-
-                if (!table::contains_key(
-                    &user_collaterals.list, signer::address_of(account)
-                )) {
-                    // If the user does not have an entry, create one
-                    table::add(
-                        &mut user_collaterals.list,
-                        signer::address_of(account),
-                        collateral_coin
-                    );
-                } else {
-                    // If the user already has an entry, merge the collateral
-                    let existing_collateral =
-                        table::borrow_mut(
-                            &mut user_collaterals.list,
-                            signer::address_of(account)
-                        );
-                    coin::merge<MyUSDC>(existing_collateral, collateral_coin);
-                };
-            };
-
-           
             open_position_internal<MyUSDC>(
                 account,
                 market_addr,
                 asset_symbol,
                 is_long,
-                size_usd,
+                size_value,
                 leverage,
                 collateral_amount,
                 string::utf8(b"MyUSDC")
             );
         } else if (collateral_type_info == b"USDT") {
-            let collateral_coin = coin::withdraw<USDT>(account, collateral_amount);
+
+            // Not supported currently
+
+            // let collateral_coin = coin::withdraw<USDT>(account, collateral_amount);
             open_position_internal<USDT>(
                 account,
                 market_addr,
                 asset_symbol,
                 is_long,
-                size_usd,
+                size_value,
                 leverage,
                 collateral_amount,
                 string::utf8(b"MyUSDT")
 
             );
         } else if (collateral_type_info == b"APT") {
-            let collateral_coin = coin::withdraw<APT>(account, collateral_amount);
+
+            // Not supported currently
+
+            // let collateral_coin = coin::withdraw<APT>(account, collateral_amount);
             open_position_internal<APT>(
                 account,
                 market_addr,
                 asset_symbol,
                 is_long,
-                size_usd,
+                size_value,
                 leverage,
                 collateral_amount,
                 string::utf8(b"APT")
@@ -399,19 +372,18 @@ module perps::perpetual_manager {
         market_addr: address,
         asset_symbol: vector<u8>,
         is_long: bool,
-        size_usd: u64,
+        size_value: u64,
         leverage: u64,
         collateral_amount: u64, //coin::Coin<CollateralCoin>
         collateral_type_info: string::String
-    ) acquires UserPositions {
+    ) acquires UserPositions, UserPositionCollaterals {
         let account_addr = signer::address_of(account);
 
         // Assert that the position does not already exist for this account and asset
         // Initialize user positions if not exists
         if (!exists<UserPositions>(account_addr)) {
             let user_positions = UserPositions {
-                positions: vector::empty<Position>(),
-                market_addresses: vector::empty()
+                positions: vector::empty<Position>()
             };
             move_to(account, user_positions);
         };
@@ -422,22 +394,18 @@ module perps::perpetual_manager {
         while (j < len) {
             let position = vector::borrow(&user_positions.positions, j);
             if (position.asset_type.coin_type == string::utf8(asset_symbol)
-                && position.collateral_type.coin_type == collateral_type_info) {
-                // assert!(position.is_long == is_long, E_POSITION_ALREADY_EXISTS);
+                && position.collateral_type.coin_type == collateral_type_info
+                && position.is_long == is_long) {
                 abort E_POSITION_ALREADY_EXISTS;
             };
             j = j + 1;
         };
 
-        // assert!(
-        //     !exists<Position<CollateralType>>(account_addr),
-        //     E_POSITION_ALREADY_EXISTS
-        // );
-        assert!(size_usd > 0, E_NEGATIVE_SIZE);
+        assert!(size_value > 0, E_NEGATIVE_SIZE);
         assert!(leverage > 0 && leverage <= 50, E_INVALID_LEVERAGE); // Max 50x leverage for example
 
         // Calculate required margin in USD (with PRICE_DECIMALS).
-        let required_margin_usd = size_usd / leverage;
+        let required_margin_usd = size_value / leverage;
         let collateral_value_usd = collateral_amount;
         // convert_coin_to_usd_value<CollateralCoin>(&collateral_amount);
 
@@ -457,9 +425,9 @@ module perps::perpetual_manager {
             owner: account_addr,
             asset_type,
             is_long,
-            size_usd,
+            size_value,
             leverage,
-            collateral_amount, // The actual Coin<CollateralCoin> is held by UserCollaterals struct
+            collateral_amount, // The actual Coin<CollateralCoin> is held by UserPositionCollaterals struct
             collateral_type: CollateralType {
                 coin_type: collateral_type_info // Store the type info as a string
             },
@@ -471,9 +439,39 @@ module perps::perpetual_manager {
             market_address: market_addr // Address of the market where this position exists
         };
 
-        let user_positions = borrow_global_mut<UserPositions>(account_addr);
         vector::push_back(&mut user_positions.positions, new_position);
-        vector::push_back(&mut user_positions.market_addresses, market_addr);
+
+        let constructor_ref = object::create_object(@aptos_perpetuals);
+        let object_signer = object::generate_signer(&constructor_ref);
+        let position_object_address = signer::address_of(&object_signer);
+
+        // Creates an extend ref, and moves it to the object
+        let extend_ref = object::generate_extend_ref(&constructor_ref);
+        move_to(&object_signer, ObjectController { extend_ref });
+
+        if (!exists<UserPositionCollaterals>(signer::address_of(account))) {
+            // If UserPositionCollaterals does not exist, we need to create it for user to store his collateral
+            let list = table::new<address, coin::Coin<MyUSDC>>();
+            let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
+            table::add(
+                &mut list,
+                position_object_address,
+                collateral_coin
+            );
+            move_to(account, UserPositionCollaterals { list });
+        } else {
+            let collateral_coin = coin::withdraw<MyUSDC>(account, collateral_amount);
+            let user_collaterals =
+                borrow_global_mut<UserPositionCollaterals>(signer::address_of(account));
+            table::add(
+                &mut user_collaterals.list,
+                position_object_address,
+                collateral_coin
+            );
+        };
+
+        // Move the position to the object signer
+        move_to(&object_signer, new_position);
 
         // Emit an event to indicate the position was opened.
         event::emit(
@@ -481,7 +479,7 @@ module perps::perpetual_manager {
                 trader: account_addr,
                 asset_symbol: string::utf8(asset_symbol),
                 is_long,
-                size_usd,
+                size_value,
                 leverage,
                 collateral_value_usd,
                 entry_price: current_price
@@ -495,14 +493,21 @@ module perps::perpetual_manager {
         account: &signer,
         asset_symbol: string::String,
         collateral_symbol: string::String,
+        is_long: bool,
+        position_object_address: address,
         market_addr: address
-    ) acquires MintCap, UserPositions {
+    ) acquires UserPositions, UserPositionCollaterals, Position {
         let account_addr = signer::address_of(account);
 
-        assert!(
-            exists<UserPositions>(account_addr),
-            E_POSITION_NOT_FOUND
-        );
+        if (exists<UserPositionCollaterals>(account_addr)) {
+            let user_collaterals =
+                borrow_global_mut<UserPositionCollaterals>(account_addr);
+            if (!table::contains(&user_collaterals.list, position_object_address)) {
+                abort E_POSITION_NOT_FOUND;
+            };
+        } else {
+            abort E_USER_HAS_NO_POSITIONS;
+        };
 
         let user_positions = borrow_global_mut<UserPositions>(account_addr);
         let len = vector::length(&user_positions.positions);
@@ -510,17 +515,28 @@ module perps::perpetual_manager {
         while (j < len) {
             let position = vector::borrow(&user_positions.positions, j);
             if (position.asset_type.coin_type == asset_symbol
-                && position.collateral_type.coin_type == collateral_symbol) {
-                // assert!(position.is_long == is_long, E_POSITION_ALREADY_EXISTS);
-                close_position_internal(account_addr, position, asset_symbol);
+                && position.collateral_type.coin_type == collateral_symbol
+                && position.is_long == is_long) {
+                close_position_internal(
+                    account,
+                    position,
+                    asset_symbol,
+                    position_object_address
+                );
+                // Remove the position from user's positions
+                vector::remove(&mut user_positions.positions, j);
             };
             j = j + 1;
         };
     }
 
     fun close_position_internal(
-        account_addr: address, position: &Position, asset_symbol: string::String
-    ) acquires MintCap {
+        account: &signer,
+        position: &Position,
+        asset_symbol: string::String,
+        position_address: address
+    ) acquires UserPositionCollaterals, Position {
+        let account_addr = signer::address_of(account);
 
         // Simulate fetching the current market price for the asset
         let current_price = get_simulated_price(*asset_symbol.bytes());
@@ -528,79 +544,89 @@ module perps::perpetual_manager {
         // === PnL Calculation ===
         // pnl_raw_usd will store the absolute profit/loss in USD (with PRICE_DECIMALS).
         // is_profit will indicate if it's a gain or a loss.
-        let pnl_raw_usd: u64 = 0;
+        let asset_PnL_value: u64 = 0;
         let is_profit: bool = false;
 
         // Calculate raw PnL based on price difference relative to position type (long/short).
         if (position.is_long) {
             if (current_price >= position.entry_price) {
-                // Long position profit: (current_price - entry_price) * size_usd / entry_price
-                pnl_raw_usd =
-                    (current_price - position.entry_price) * position.size_usd
+                // Long position profit: (current_price - entry_price) * size_value / entry_price
+                asset_PnL_value =
+                    (current_price - position.entry_price) * position.size_value
                         / position.entry_price;
                 is_profit = true;
             } else {
-                // Long position loss: (entry_price - current_price) * size_usd / entry_price
-                pnl_raw_usd =
-                    (position.entry_price - current_price) * position.size_usd
+                // Long position loss: (entry_price - current_price) * size_value / entry_price
+                asset_PnL_value =
+                    (position.entry_price - current_price) * position.size_value
                         / position.entry_price;
                 is_profit = false;
             }
         } else { // Short position
             if (current_price <= position.entry_price) {
-                // Short position profit: (entry_price - current_price) * size_usd / entry_price
-                pnl_raw_usd =
-                    (position.entry_price - current_price) * position.size_usd
+                // Short position profit: (entry_price - current_price) * size_value / entry_price
+                asset_PnL_value =
+                    (position.entry_price - current_price) * position.size_value
                         / position.entry_price;
                 is_profit = true;
             } else {
-                // Short position loss: (current_price - entry_price) * size_usd / entry_price
-                pnl_raw_usd =
-                    (current_price - position.entry_price) * position.size_usd
+                // Short position loss: (current_price - entry_price) * size_value / entry_price
+                asset_PnL_value =
+                    (current_price - position.entry_price) * position.size_value
                         / position.entry_price;
                 is_profit = false;
             }
         };
 
-        // Convert PnL_USD to the collateral coin amount (in its raw value, e.g., 6 decimals for USDC)
-        let pnl_collateral_value_raw = pnl_raw_usd;
-        // convert_usd_to_coin_value<CollateralCoin>(pnl_raw_usd);
-        let final_collateral_value: u64;
+        let position_object = object::address_to_object<Position>(position_address);
 
-        // In real production environment, this is supposed to be recieved  NOT minted. but were are trying to simulate
-        //  the profit/loss scenario by minting the required coins
-        let mint = borrow_global<MintCap<MyUSDC>>(@aptos_perpetuals);
-        // Mint custom test coin (e.g., 1000 USDC equivalent with 6 decimals)
-        let pnl_collateral =
-            aptos_framework::coin::mint<MyUSDC>(
-                pnl_collateral_value_raw, &mint.mint_cap
-            );
+        let user_collaterals = borrow_global_mut<UserPositionCollaterals>(account_addr);
+        let existing_collateral =
+            table::remove(&mut user_collaterals.list, position_address);
+        let existing_collateral_value = coin::value(&existing_collateral);
+        let final_collateral_value: u64 = 0;
 
-        let position_collateral_value = position.collateral_amount;
-        // convert_coin_to_usd_value(&position.collateral_amount);
-        let final_collateral_value_usd = position_collateral_value + pnl_raw_usd;
+        // Caluculate after adding and deducting funding amount to collateral
+        if (position.is_long) {
+            if (position.unrealized_funding_direction == FUNDING_POSITIVE) {
+                // Funding is positive, so we deduct unrealized funding amount from collateral
+                final_collateral_value =
+                    existing_collateral_value - position.unrealized_funding_amount;
+            } else {
+                // Funding is negative, so we add unrealized funding amount to collateral
+                final_collateral_value =
+                    existing_collateral_value + position.unrealized_funding_amount;
+            };
+        } else {
+            if (position.unrealized_funding_direction == FUNDING_POSITIVE) {
+                // Funding is positive, so we add unrealized funding amount to collateral
+                final_collateral_value =
+                    existing_collateral_value + position.unrealized_funding_amount;
+            } else {
+                // Funding is negative, so we deduct unrealized funding amount from collateral
+                final_collateral_value =
+                    existing_collateral_value - position.unrealized_funding_amount;
+            };
+        };
 
         if (is_profit) {
-            final_collateral_value = position.collateral_amount
-                + pnl_collateral_value_raw;
-            // coin::value(&position.collateral_amount) + pnl_collateral_value_raw;
+            // Send asset value profit to the user.
+
         } else {
-            // If loss, check if collateral is sufficient to cover. If not, abort (liquidation scenario).
+            // If asset value loss, check if collateral is sufficient to cover. If not, abort (liquidation scenario).
             assert!(
-                position.collateral_amount >= pnl_collateral_value_raw,
+                existing_collateral_value >= asset_PnL_value,
                 // coin::value(&position.collateral_amount) >= pnl_collateral_value_raw,
                 E_LIQUIDATED_DUE_TO_LOSS
             );
-            final_collateral_value = position.collateral_amount
-                - pnl_collateral_value_raw;
-            // coin::value(&position.collateral_amount) - pnl_collateral_value_raw;
         };
 
-        // Create the final collateral coin to return.
-        // let final_collateral_coin = coin::from_raw_value(final_collateral_value);
+        move_from<Position>(position_address);
 
-        // let final_collateral_coin =
-        //     coin::withdraw<CollateralCoin>(account, final_collateral_value);
+        // let balance = coin::balance<CollateralCoin>(account_addr);
+        // let message2 = string::utf8(b"MyUSDC balance amount is  :");
+        // debug::print(&message2);
+        // debug::print(&balance);
 
         // Emit an event to indicate the position was closed.
         event::emit(
@@ -608,54 +634,13 @@ module perps::perpetual_manager {
                 trader: account_addr,
                 asset_symbol: position.asset_type.coin_type,
                 is_long: position.is_long,
-                size_usd: position.size_usd,
+                size_value: position.size_value,
                 leverage: position.leverage,
-                collateral_returned_value_usd: final_collateral_value_usd, // Value of returned collateral in USD
-                pnl_usd: pnl_raw_usd,
+                collateral_returned_value_usd: final_collateral_value, // Value of returned collateral in USD
+                pnl_usd: asset_PnL_value,
                 is_profit
             }
         );
-
-        // // Deposit the final collateral back to the user's account.
-        // coin::deposit<CollateralCoin>(account_addr, final_collateral_coin);
-        // let message1 = string::utf8(b"Desposited final collateral amount is  :");
-        // debug::print(&message1);
-        // debug::print(&final_collateral_value);
-
-        coin::deposit<MyUSDC>(account_addr, pnl_collateral);
-        // let message4 = string::utf8(b"Desposited pnl collateral amount is  :");
-        // debug::print(&message4);
-        // debug::print(&pnl_collateral_value_raw);
-
-        let Position {
-            owner,
-            asset_type,
-            entry_price,
-            size_usd,
-            leverage,
-            collateral_amount,
-            collateral_type,
-            is_long,
-            opened_at,
-            unrealized_funding_amount,
-            unrealized_funding_direction,
-            last_funding_payment,
-            market_address
-        } = position;
-        // let message3 = string::utf8(b"Depositing collateral amount is  :");
-
-        // debug::print(&message3);
-        // debug::print(&collateral_amount);
-        coin::deposit<CollateralCoin>(account_addr, collateral_amount);
-
-        // // move_to(account,collateral_amount);
-        // let cap = borrow_global<BurnCap<CollateralCoin>>(@aptos_perpetuals);
-        // coin::burn<CollateralCoin>(collateral_amount, &cap.burn_cap);
-
-        // let balance = coin::balance<CollateralCoin>(account_addr);
-        // let message2 = string::utf8(b"MyUSDC balance amount is  :");
-        // debug::print(&message2);
-        // debug::print(&balance);
 
     }
 
@@ -671,7 +656,7 @@ module perps::perpetual_manager {
         u64,
         u64,
         u64 // Simplified return type for demo
-    ) acquires Position {
+    ) acquires UserPositions {
         let user_positions = borrow_global_mut<UserPositions>(addr);
         let len = vector::length(&user_positions.positions);
         let j = 0;
@@ -684,7 +669,7 @@ module perps::perpetual_manager {
                     position.owner,
                     position.asset_type.coin_type,
                     position.is_long,
-                    position.size_usd,
+                    position.size_value,
                     position.leverage,
                     position.collateral_amount, // Return raw value of collateral
                     position.entry_price,
@@ -891,17 +876,11 @@ module perps::perpetual_manager {
                 let pos_len = vector::length(&user_positions.positions);
 
                 while (j < pos_len) {
-                    let market_addr_at_j =
-                        *vector::borrow(&user_positions.market_addresses, j);
-
-                    if (market_addr_at_j == market_addr) {
-                        let position = vector::borrow_mut(
-                            &mut user_positions.positions, j
-                        );
+                    let position = vector::borrow_mut(&mut user_positions.positions, j);
+                    if (position.market_address == market_addr) {
                         let time_elapsed = current_time - position.last_funding_payment;
-
                         if (time_elapsed >= FUNDING_INTERVAL_SECONDS) {
-                            let (funding_amount, funding_direction) =
+                            let (funding_rate, funding_direction) =
                                 calculate_funding_payment(
                                     position,
                                     market.funding_rate_amount,
@@ -909,11 +888,20 @@ module perps::perpetual_manager {
                                     time_elapsed
                                 );
 
-                            // Update unrealized funding based on payment direction
-                            if (funding_direction == FUNDING_POSITIVE) {
-                                // Position owes money
+                            // Determine if this specific position pays or receives funding
+                            let position_pays_funding =
+                                if (position.is_long) {
+                                    funding_direction == FUNDING_POSITIVE // Long pays when funding is positive and Long receives when negative
+                                } else {
+                                    funding_direction == FUNDING_NEGATIVE // Short pays when funding is negative and Short receives when positive
+                                };
+                            let funding_amount = funding_rate * position.size_value;
+
+                            if (position_pays_funding) {
+                                // This position PAYS funding
                                 if (position.unrealized_funding_direction
                                     == FUNDING_POSITIVE) {
+                                    // Both are paying direction, add them
                                     position.unrealized_funding_amount =
                                         position.unrealized_funding_amount
                                             + funding_amount;
@@ -933,9 +921,10 @@ module perps::perpetual_manager {
                                     };
                                 };
                             } else {
-                                // Position receives money
+                                // This position RECEIVES funding
                                 if (position.unrealized_funding_direction
                                     == FUNDING_NEGATIVE) {
+                                    // Both are receiving direction, add them
                                     position.unrealized_funding_amount =
                                         position.unrealized_funding_amount
                                             + funding_amount;
@@ -955,11 +944,19 @@ module perps::perpetual_manager {
                                     };
                                 };
                             };
-
                             position.last_funding_payment = current_time;
 
-                            // Emit funding payment event (in a real implementation, you'd use events)
-                            // For now, we just update the position
+                            // Emit funding payment event
+                            event::emit(
+                                FundingPaymentEvent {
+                                    user: user_addr,
+                                    market: market_addr,
+                                    amount: funding_amount,
+                                    unrealized_amount: position.unrealized_funding_amount,
+                                    funding_rate,
+                                    timestamp: timestamp::now_seconds()
+                                }
+                            );
                         };
                     };
                     j = j + 1;
@@ -970,20 +967,20 @@ module perps::perpetual_manager {
     }
 
     /// Calculate funding payment for a position
-    fun calculate_funding_payment<CollateralCoin>(
-        position: &Position<CollateralCoin>,
+    fun calculate_funding_payment(
+        position: &Position,
         funding_rate_amount: u64,
         funding_rate_direction: u8,
         time_elapsed: u64
     ): (u64, u8) {
-        if (time_elapsed == 0 || position.size_usd == 0) {
+        if (time_elapsed == 0 || position.size_value == 0) {
             return (0, FUNDING_POSITIVE)
         };
 
         // Funding payment = position_size * funding_rate * (time_elapsed / FUNDING_INTERVAL_SECONDS)
         let time_factor = (time_elapsed * PRECISION) / FUNDING_INTERVAL_SECONDS;
-        let base_payment = (position.size_usd * funding_rate_amount * time_factor)
-            / PRECISION;
+        let base_payment =
+            (position.size_value * funding_rate_amount * time_factor) / PRECISION;
 
         // Determine who pays whom based on position type and funding direction
         let payment_direction =
@@ -1025,7 +1022,7 @@ module perps::perpetual_manager {
 
         let position = vector::borrow(&user_positions.positions, position_index);
         (
-            position.size_usd,
+            position.size_value,
             position.is_long,
             position.leverage,
             position.entry_price,
@@ -1134,7 +1131,7 @@ module perps::perpetual_manager {
 
         // let initial_usdc = coin::withdraw<MyUSDC>(&trader, 50 * pow(10u64, 6)); // 50 USDC collateral (6 decimals)
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position (8 decimals)
+        let position_size_value = 1000 * pow(10u64, 8); // $1000 position (8 decimals)
         let leverage = 20; // 20x leverage
 
         let market_address = initialize_market<BTC>(&admin_signer, 100_0000, 100_0300);
@@ -1144,7 +1141,7 @@ module perps::perpetual_manager {
             market_address,
             *string::bytes(&btc_symbol),
             true,
-            position_size_usd,
+            position_size_value,
             leverage,
             50 * pow(10u64, 6),
             b"MyUSDC"
@@ -1156,7 +1153,7 @@ module perps::perpetual_manager {
         assert!(owner == signer::address_of(&trader), 100);
         assert!(symbol == btc_symbol, 101);
         assert!(is_long == true, 102);
-        assert!(size == position_size_usd, 103);
+        assert!(size == position_size_value, 103);
         assert!(lev == leverage, 104);
         assert!(collateral_val == 50 * pow(10u64, 6), 105); // Initial collateral value (raw) * pow(10u64, 6)
         assert!(entry_p == SIMULATED_BTC_PRICE_USD, 106); // Entry price should match simulated
@@ -1175,7 +1172,7 @@ module perps::perpetual_manager {
         //     &trader, initial_usdc_collateral_amount
         // );
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position
+        let position_size_value = 1000 * pow(10u64, 8); // $1000 position
         let leverage = 20;
 
         // Before opening, set a lower simulated BTC price to ensure a profit when closing
@@ -1193,7 +1190,7 @@ module perps::perpetual_manager {
             &trader,
             *string::bytes(&btc_symbol),
             true,
-            position_size_usd,
+            position_size_value,
             leverage,
             initial_usdc_collateral_amount,
             b"MyUSDC"
@@ -1232,14 +1229,14 @@ module perps::perpetual_manager {
         //     &trader, 10 * pow(10u64, 8)
         // ); // 10 APT collateral (8 decimals)
         let eth_symbol = string::utf8(b"ETH");
-        let position_size_usd = 5000 * pow(10u64, 8); // $5000 position * pow(10u64, 8)
+        let position_size_value = 5000 * pow(10u64, 8); // $5000 position * pow(10u64, 8)
         let leverage = 10;
 
         open_position(
             &trader,
             *string::bytes(&eth_symbol),
             false,
-            position_size_usd,
+            position_size_value,
             leverage,
             10 * pow(10u64, 8), //
             b"MyUSDC"
@@ -1250,7 +1247,7 @@ module perps::perpetual_manager {
         assert!(owner == signer::address_of(&trader), 110);
         assert!(symbol == eth_symbol, 111);
         assert!(is_long == false, 112);
-        assert!(size == position_size_usd, 113);
+        assert!(size == position_size_value, 113);
         assert!(lev == leverage, 114);
         assert!(collateral_val == 10 * pow(10u64, 8), 115); // Raw APT value // * pow(10u64, 8)
     }
@@ -1269,14 +1266,14 @@ module perps::perpetual_manager {
         // but only provide 1 USDC (~$1).
         // let initial_usdc = coin::withdraw<MyUSDC>(&trader, 1 * pow(10, 6)); // Too little collateral (1 USDC)
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10, 8); // * pow(10, 8)
+        let position_size_value = 1000 * pow(10, 8); // * pow(10, 8)
         let leverage = 20;
 
         open_position(
             &trader,
             *string::bytes(&btc_symbol),
             true,
-            position_size_usd,
+            position_size_value,
             leverage,
             1 * pow(10, 6), // * pow(10, 6)
             b"MyUSDC"
@@ -1317,14 +1314,14 @@ module perps::perpetual_manager {
         coin::deposit(signer::address_of(&trader), coin);
 
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10, 8); //
+        let position_size_value = 1000 * pow(10, 8); //
         let leverage = 10;
 
         open_position(
             &trader,
             *string::bytes(&btc_symbol),
             true,
-            position_size_usd,
+            position_size_value,
             leverage,
             10 * pow(10, 6), // * pow(10, 6)
             b"UnknownCoin"
@@ -1346,14 +1343,14 @@ module perps::perpetual_manager {
         //     &trader, initial_usdc_collateral_amount
         // );
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position  * pow(10u64, 8)
+        let position_size_value = 1000 * pow(10u64, 8); // $1000 position  * pow(10u64, 8)
         let leverage = 20; // Margin required is $50 (50 * 10^8 scaled USD)
 
         // open_position(
         //     &trader,
         //     *string::bytes(&btc_symbol),
         //     true,
-        //     position_size_usd,
+        //     position_size_value,
         //     leverage,
         //     50 * pow(10u64, 6), // * pow(10u64, 6)
         //     b"MyUSDC"
@@ -1367,7 +1364,7 @@ module perps::perpetual_manager {
         // A more complex test setup would be needed to manipulate oracle prices dynamically.
         // For this specific test to fail with E_LIQUIDATED_DUE_TO_LOSS,
         // the `initial_usdc_collateral_amount` would need to be very small,
-        // and the `position_size_usd` and `leverage` would need to result in a
+        // and the `position_size_value` and `leverage` would need to result in a
         // calculated PnL_USD greater than the collateral converted to USD.
 
         // Example calculation for a large loss if simulated price dropped to $1 (conceptual):
@@ -1377,7 +1374,7 @@ module perps::perpetual_manager {
         // 50 USDC = 50 USD collateral. A loss of $1000 would exceed $50 collateral.
         // With current fixed prices, `pnl_raw_usd` will be 0.
         // To make this test abort, the `open_position` collateral must be very small.
-        // Let's adjust `initial_usdc_collateral_amount` and `position_size_usd`
+        // Let's adjust `initial_usdc_collateral_amount` and `position_size_value`
         // in the `open_position` call to trigger the liquidation logic
         // with the current fixed price.
 
@@ -1418,7 +1415,7 @@ module perps::perpetual_manager {
             &trader,
             *string::bytes(&btc_symbol),
             true,
-            position_size_usd,
+            position_size_value,
             leverage,
             initial_usdc_collateral_amount,
             b"MyUSDC"
@@ -1436,7 +1433,7 @@ module perps::perpetual_manager {
         //     &trader, initial_usdc_collateral_amount
         // );
         let btc_symbol = string::utf8(b"BTC");
-        let position_size_usd = 1000 * pow(10u64, 8); // $1000 position * pow(10u64, 8)
+        let position_size_value = 1000 * pow(10u64, 8); // $1000 position * pow(10u64, 8)
         let leverage = 10; // Margin required is $100 (100 * 10^8 scaled USD)
 
         // debug::print(&initial_usdc_collateral_amount);
@@ -1445,7 +1442,7 @@ module perps::perpetual_manager {
             &trader,
             *string::bytes(&btc_symbol),
             true,
-            position_size_usd,
+            position_size_value,
             leverage,
             initial_usdc_collateral_amount,
             b"MyUSDC"

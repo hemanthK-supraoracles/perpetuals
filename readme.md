@@ -37,6 +37,7 @@ Funding Rate Theory:
 - How to handle liquidation of user position, when his collateral is not enough to cover his position
 - We must decide what should be highest leverage a user can have
 - Does it differ with different asset types?
-- We have to decide how often do we run funding rate mechanism
+- We have to decide how often do we run funding rate mechanism, Time interval
 - We have to decide how to caluculate funding rate
+- Should we let user create 2 positions for same asset type with same collateral for both long and short
 
