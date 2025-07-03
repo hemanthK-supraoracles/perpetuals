@@ -8,13 +8,9 @@
 - Market represents data structure for a single asset type.
 
 - Users can open / close positions for an Asset type. When user closes his position we have to caluculate his Final
- Profit and Loss (PnL) balance and transfer it to his wallet. 
+  Profit and Loss (PnL) balance and transfer it to his wallet. 
  
-?? We have to decide whether we transfer it in single asset type or both Asset and Collateral type
-
 - Leverage lets user bet of higher amount than his actual balance. It is calculated as Leverage = (Asset size Value / Collateral Value) 
-?? We must decide what should be highest leverage a user can have
-?? Does it differ with different asset types?
 
 
 - All the collected collateral is stores in UserCollateral struct for each user.
@@ -33,8 +29,14 @@ Funding Rate Theory:
 
 - The formula may also include a cap and a floor to limit the maximum and minimum funding rate possible. It is important to note that the exact formula can vary depending on the specific exchange or platform you are using.
 
-?? We have to decide how often do we run funding rate mechanism 
-?? We have to decide how to calculate funding rate
 
 
 ## Features to be decided
+
+- We have to decide how we transfer asset, collateral after user closes his position 
+- How to handle liquidation of user position, when his collateral is not enough to cover his position
+- We must decide what should be highest leverage a user can have
+- Does it differ with different asset types?
+- We have to decide how often do we run funding rate mechanism
+- We have to decide how to caluculate funding rate
+
