@@ -21,17 +21,17 @@
 
 ## Theory
 
-FUNDING RATE THEORY: 
-Spot price definition: Actual price of asset in reality
-Contract price / Perpetual price: Trading price of asset in the contract.
+Funding Rate Theory: 
+- Spot price definition: Actual price of asset in reality
+- Contract price / Perpetual price: Trading price of asset in the contract.
 
 - The funding rate is a mechanism that ensures that the price of the perpetual futures contract stays close to the spot price of the underlying asset. It is a periodic payment exchanged between the buyers (longs) and sellers (shorts) of the contract, based on the difference between the contract price and the spot price, similar in some ways to a swap contract.
 
-The funding rate can be positive or negative, depending on market conditions. When the funding rate is positive, it means that the contract price is higher than the spot price, also known as contango. In this case, the longs pay the shorts the funding amount. When the funding rate is negative, it means that the contract price is lower than the spot price, known as backwardation. In this case, the shorts pay the longs the funding amount.
+- The funding rate can be positive or negative, depending on market conditions. When the funding rate is positive, it means that the contract price is higher than the spot price, also known as contango. In this case, the longs pay the shorts the funding amount. When the funding rate is negative, it means that the contract price is lower than the spot price, known as backwardation. In this case, the shorts pay the longs the funding amount.
 
-The funding rate is usually calculated based on a combination of the perpetual contract’s price, the spot price, and an interest rate component. The interest rate reflects the cost of borrowing or lending the underlying asset, while the premium index reflects the difference between the contract price and the spot price.
+- The funding rate is usually calculated based on a combination of the perpetual contract’s price, the spot price, and an interest rate component. The interest rate reflects the cost of borrowing or lending the underlying asset, while the premium index reflects the difference between the contract price and the spot price.
 
-The formula may also include a cap and a floor to limit the maximum and minimum funding rate possible. It is important to note that the exact formula can vary depending on the specific exchange or platform you are using.
+- The formula may also include a cap and a floor to limit the maximum and minimum funding rate possible. It is important to note that the exact formula can vary depending on the specific exchange or platform you are using.
 
 ?? We have to decide how often do we run funding rate mechanism 
 ?? We have to decide how to calculate funding rate
