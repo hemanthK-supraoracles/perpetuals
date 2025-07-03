@@ -1,3 +1,4 @@
+## Contract description
 - The contract is a perpetual contract, which means it does not have an expiration date.
 
 - Initially we are using custom "MyUSDC" coin as a collateral for all users
@@ -18,6 +19,7 @@
 
 - All the collected collateral is stores in UserCollateral struct for each user.
 
+## Theory
 
 FUNDING RATE THEORY: 
 Spot price definition: Actual price of asset in reality
@@ -33,3 +35,6 @@ The formula may also include a cap and a floor to limit the maximum and minimum 
 
 ?? We have to decide how often do we run funding rate mechanism 
 ?? We have to decide how to calculate funding rate
+
+
+## Features to be decided
