@@ -1,4 +1,4 @@
-// module perps::message {
+// module perpetual_trading::message {
 //     use std::string;
 //     use std::signer;
 //     use std::debug;  // Add this for debug prints

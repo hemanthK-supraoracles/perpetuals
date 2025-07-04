@@ -1,11 +1,11 @@
 [package]
-name = "perps"
+name = "perpetual_trading"
 version = "1.0.0"
 authors = []
 
 [addresses]
 aptos_perpetuals = '39b65039ac1a1618f84e0f8c8866eb0cbca416edf3d4bc9244e763e57d35a377'
-perps = '39b65039ac1a1618f84e0f8c8866eb0cbca416edf3d4bc9244e763e57d35a377'
+perpetual_trading = '39b65039ac1a1618f84e0f8c8866eb0cbca416edf3d4bc9244e763e57d35a377'
 
 [dev-addresses]
 

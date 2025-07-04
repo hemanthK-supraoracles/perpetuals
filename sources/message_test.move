@@ -1,9 +1,9 @@
 // #[test_only]
-// module perps::message_tests {
+// module perpetual_trading::message_tests {
 //     use std::string;
 //     use std::signer;
 //     use aptos_framework::account;
-//     use perps::message;
+//     use perpetual_trading::message;
 
 //     #[test]
 //     fun test_set_and_get_message() {
